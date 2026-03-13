@@ -1,0 +1,98 @@
+# docker-compose.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Services: db (PostgreSQL) · api (FastAPI/Gunicorn) · nginx (reverse proxy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: ministorage_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-storageuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storagepass}
+      POSTGRES_DB:       ${POSTGRES_DB:-ministorage}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"       # expose for DB tooling; remove in production
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-storageuser} -d ${POSTGRES_DB:-ministorage}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - storage_net
+
+
+  # ── FastAPI / Gunicorn ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ministorage_api
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-storageuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storagepass}
+      POSTGRES_DB:       ${POSTGRES_DB:-ministorage}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      STORAGE_ROOT:      /app/storage
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-100}
+      LOG_LEVEL:         ${LOG_LEVEL:-INFO}
+      APP_ENV:           ${APP_ENV:-development}
+    volumes:
+      # Named volume so uploaded files survive container restarts
+      - storage_data:/app/storage
+    expose:
+      - "8000"            # only reachable via Nginx — not exposed to host
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL",
+             "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage_net
+
+
+  # ── Nginx ───────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: ministorage_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - storage_net
+
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  storage_data:          # persists uploaded files across container restarts
+    driver: local
+
+# ── Network ───────────────────────────────────────────────────────────────────
+networks:
+  storage_net:
+    driver: bridge
